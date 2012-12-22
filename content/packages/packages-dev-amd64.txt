@@ -1,0 +1,5 @@
+gcc-multilib
+g++-multilib
+libc6-dev-i386
+libx11-dev:i386
+# Other i386 dev packages conflict with their native versions and are listed in manual-dev-amd64.txt
