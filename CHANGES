@@ -1,0 +1,5 @@
+
+1.0.1:
+* Sam Lantinga, Wed Dec 26 09:28:20 PST 2012
+  Added script to generate a list of package dependencies for software in content/usr/bin/gensteamdeps
+

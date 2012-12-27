@@ -1,3 +1,4 @@
+apt-file
 build-essential
 file
 gdb

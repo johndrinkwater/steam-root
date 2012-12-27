@@ -1,0 +1,286 @@
+#!/usr/bin/python
+#
+# This is a script to create a set of runtime package dependencies for software.
+# It uses apt-file to find appropriate packages, and will update the package list if necessary.
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+# The version of the Steam runtime that we are building package dependencies against
+STEAM_RUNTIME = 1
+
+# The format of the dependency information we output
+STEAM_DEPENDENCY_VERSION = 1
+
+
+###
+class Package(object):
+	"""
+	Class containing package information
+	"""
+	def __init__( self, name ):
+		self.name = name
+		self.libraries = set()
+
+	def addLibrary( self, library ):
+		"""
+		Add a library dependency to the list provided by this package
+		"""
+		self.libraries.add( library )
+
+	def getVersion( self ):
+		"""
+		Find out what version of this package is installed
+		"""
+		process = subprocess.Popen( ["dpkg", "-l", self.name], stdout=subprocess.PIPE )
+		installed_pattern = re.compile( r"^ii\s+([^\s]+)\s+([^\s]+)" )
+		for line in process.stdout:
+			line = line.decode( "utf-8" )
+			match = re.match( installed_pattern, line )
+			if ( match is None ):
+				continue
+
+			return match.group(2)
+
+		return None
+
+
+###
+architecturePatterns = {
+	"i386" : re.compile( r"ELF 32-bit .*, Intel 80386" ),
+	"amd64" : re.compile( r"ELF 64-bit .*, x86-64" ),
+}
+def getFileArchitecture( file ):
+	"""
+	Get the architecture of an executable file on disk
+	"""
+	signature = subprocess.check_output( ["file", "-L", file] ).decode("utf-8")
+	for arch in architecturePatterns.keys():
+		if ( re.search( architecturePatterns[ arch ], signature ) is not None ):
+			return arch
+
+	return None
+
+
+
+###
+def findCustomLibraries( args, path, customLibraries ):
+	"""
+	Find custom libraries that are included with the application
+	"""
+	namePattern = re.compile( "\.so" )
+
+	if ( not os.path.exists( path ) ):
+		sys.stderr.write( "Warning: Custom library path '%s' doesn't exist\n" % path )
+		return
+
+	for root, dirs, files in os.walk( path ):
+		for name in files:
+			match = re.search( namePattern, name )
+			if ( match is None ):
+				continue
+
+			if args.verbose:
+				print( "Adding custom library %s" % name )
+			customLibraries.add( name )
+
+
+###
+def processFile( args, file, customLibraries ):
+	if ( args.verbose ):
+		print( "Processing %s" % file )
+
+	library_pattern = re.compile( r"^\s*([^\s]+)\s+=>\s+([^\s\(\)]+)" )
+	process = subprocess.Popen( ["ldd", file], stdout=subprocess.PIPE )
+	for line in process.stdout:
+		line = line.decode( "utf-8" ).strip()
+		match = re.match( library_pattern, line )
+		if ( match is None ):
+			continue
+
+		name = match.group(1)
+
+		# FIXME: Need to handle localized output here
+		if line.find( "not found" ) >= 0:
+			if ( args.verbose ):
+				if ( name in customLibraries ):
+					print( "\t%s => custom library" % name )
+				else:
+					print( "\t%s => not found" % name )
+
+			args.libraries.add( (name, None) )
+		else:
+			file = match.group(2)
+			if ( args.verbose ):
+				print( "\t%s => %s" % (name, file) )
+			args.libraries.add( (name, file) )
+
+
+###
+def main():
+	parser = argparse.ArgumentParser( description="Create a package dependency list given a list of executable files" )
+	parser.add_argument( "--extra-packages", nargs="+",
+	                     help="Additional package dependencies to include in the output" )
+	parser.add_argument( "--library-path", "-L",
+	                     help="Additional path to search for custom libraries, separated by ':'" )
+	parser.add_argument( "--output", "-o",
+	                     help="Save the dependency list in the given output file" )
+	parser.add_argument( "--output-versions", action="store_true",
+	                     help="Output the currently installed version of packages" )
+	parser.add_argument( "--runtime", "-r", default=STEAM_RUNTIME,
+	                     help="The version of the Steam runtime that we're building dependencies against" )
+	parser.add_argument( "--verbose", "-v", action="store_true",
+	                     help="Show progress and files being processed" )
+	parser.add_argument( "files", metavar="files", nargs="+",
+	                     help="Executable files to scan for package dependencies" )
+	args = parser.parse_args()
+
+	# Build a list of custom libraries
+	customLibraries = set()
+	if args.library_path is not None:
+		libraryPaths = args.library_path.split( ":" )
+		libraryPaths.reverse()
+		for path in libraryPaths:
+			findCustomLibraries( args, path, customLibraries )
+
+	# Open the output
+	warnings = 0
+	if ( args.output is None ):
+		args.output = sys.stdout
+	else:
+		outputFile = args.output
+		try:
+			args.output = open( outputFile, "w" )
+		except Exception as e:
+			sys.stderr.write( "Couldn't write to %s: %s\n" % (outputFile, e) )
+			return 3
+
+	# Add the prologue
+	args.output.write( """\
+# This is a package dependency manifest created with the command line:
+#	%s
+
+# The version of the Steam runtime used by this program:
+STEAM_RUNTIME=%s
+
+# The format of this dependency manifest:
+STEAM_DEPENDENCY_VERSION=%s
+
+""" % (" ".join(sys.argv), STEAM_RUNTIME, STEAM_DEPENDENCY_VERSION) )
+
+	# Process the input files
+	architectures = set()
+	args.libraries = set()
+	for file in args.files:
+		if ( not os.path.exists( file ) ):
+			sys.stderr.write( "%s doesn't exist\n" % file )
+			args.output.close()
+			return 4
+
+		arch = getFileArchitecture( file )
+		if ( arch is None ):
+			sys.stderr.write( "%s has unknown architecture (supported: %s)\n" % (file, ", ".join( architecturePatterns.keys() )) )
+			args.output.close()
+			return 5
+
+		architectures.add( arch )
+
+		processFile( args, file, customLibraries )
+
+	# Process the libraries into packages
+	dependencies = set()
+	args.packages = {}
+	(fd, tempFile) = tempfile.mkstemp()
+	for (name, path) in args.libraries:
+		# Ignore libraries that are included in custom library paths
+		if ( name in customLibraries ):
+			if ( args.verbose ):
+				print( "Found dependency '%s' in the custom library path, ignoring." % name )
+			continue
+
+		if not path:
+			args.output.write("# WARNING: library '%s' couldn't be found in the library path, maybe you need to add --library-path command line option?\n" % name )
+			warnings += 1
+			continue
+
+		if ( args.verbose ):
+			print( "Adding dependency '%s'" % path )
+
+		dependencies.add(path)
+		os.write(fd, ("%s\n" % path).encode( "utf-8" ) )
+
+	packages = {}
+	package_pattern = re.compile( r"^([^\s]+):\s+([^\s]+)" )
+	for arch in architectures:
+		process = subprocess.Popen( ["apt-file", "find", "-a", arch, "--from-file", tempFile, "--fixed-string"], stdout=subprocess.PIPE )
+		for line in process.stdout:
+			line = line.decode( "utf-8" )
+			match = re.match( package_pattern, line )
+			if ( match is None ):
+				continue
+
+			name = match.group(1) + ":" + arch
+			path = match.group(2)
+			try:
+				package = packages[ name ]
+			except KeyError:
+				package = packages[ name ] = Package( name )
+
+			if ( args.verbose ):
+				print( "Found dependency '%s' in %s" % (path, name) )
+
+			package.addLibrary( path )
+			dependencies.remove( path )
+
+	os.unlink(tempFile)
+
+	# Warn about any libraries we couldn't find
+	if ( len(dependencies) > 0 ):
+		if ( len(architectures) > 0 ):
+			args.output.write( "# WARNING: Couldn't find packages for the following libraries: (need to run apt-file update -a with architectures [%s]?)\n" % ", ".join( architectures ) )
+		for path in sorted( dependencies ):
+			args.output.write( "# \t%s\n" % path )
+		args.output.write( "\n" )
+		warnings += 1
+
+	# Output package dependency list
+	for name in sorted( packages.keys() ):
+		package = packages[ name ]
+		args.output.write( "# Package %s needed for %s\n" % (package.name, ", ".join( package.libraries )) )
+
+		versionCondition = ""
+		if ( args.output_versions ):
+			version = package.getVersion()
+			if version is None:
+				args.output.write( "# WARNING: Couldn't get installed package version\n" )
+				warnings += 1
+			else:
+				versionCondition = (" (>= %s)" % version)
+
+		args.output.write( "%s%s\n" % (package.name, versionCondition) )
+
+	# Add any additional packages
+	if ( args.extra_packages is not None ):
+		args.output.write( "\n" )
+		args.output.write( "# Additional package dependencies:\n" )
+		for name in args.extra_packages:
+			args.output.write( "%s\n" % name )
+
+	# All done!
+	if ( warnings > 0 ):
+		sys.stderr.write( "Work complete with warnings, check output for details.\n" )
+	elif ( args.verbose ):
+		print( "Work complete." )
+	args.output.close()
+
+	return 0
+
+
+###
+if __name__ == "__main__":
+	status = main()
+	sys.exit(status)

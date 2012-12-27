@@ -3,7 +3,7 @@
 #
 # In order to build the amd64 environment you must be running amd64
 
-VERSION := 1.0.0
+VERSION := 1.0.1
 
 ifeq ($(shell dpkg --print-architecture), amd64)
 ARCHES := i386 amd64

@@ -157,6 +157,9 @@ action_update()
     # Copy in initial content
     cp -av content/* $root/
 
+    # Copy changelog
+    cp -v CHANGES $root/
+
     # If sudo doesn't exist, we'll emulate it with fakeroot
     # This is because we don't want the chroot environment to require root
     # permissions for anything, in case normal users want to use it.
