@@ -139,14 +139,7 @@ def processFile( args, file, arch, customLibraries ):
 				print( "\tnot linked directly with %s, skipping" % name )
 			continue
 
-		if line.find( "/" ) >= 0:
-			path = match.group(2)
-			if ( args.verbose ):
-				print( "\t%s => %s" % (name, path) )
-
-			args.libraries[ arch ].add( (name, path) )
-
-		elif ( arch in customLibraries and name in customLibraries[ arch ] ):
+		if ( arch in customLibraries and name in customLibraries[ arch ] ):
 			if ( args.verbose ):
 				print( "\t%s => custom library" % name )
  
@@ -154,6 +147,14 @@ def processFile( args, file, arch, customLibraries ):
 
 			# Need to process the custom library for dependencies
 			customDependencies.add( customLibraries[ arch ][ name ] )
+
+		elif line.find( "/" ) >= 0:
+			path = match.group(2)
+			if ( args.verbose ):
+				print( "\t%s => %s" % (name, path) )
+
+			args.libraries[ arch ].add( (name, path) )
+
 		else:
 			if ( args.verbose ):
 				print( "\t%s => not found" % name )
