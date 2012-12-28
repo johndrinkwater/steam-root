@@ -80,21 +80,50 @@ def findCustomLibraries( args, path, customLibraries ):
 
 	for root, dirs, files in os.walk( path ):
 		for name in files:
+			if ( name.endswith( ".dbg" ) ):
+				continue
+
 			match = re.search( namePattern, name )
 			if ( match is None ):
 				continue
 
+			path = os.path.join( root, name )
+			arch = getFileArchitecture( path )
+			if arch is None:
+				if args.verbose:
+					print( "Skipping custom library %s with unknown architecture" % path )
+				continue
+
 			if args.verbose:
-				print( "Adding custom library %s" % name )
-			customLibraries.add( name )
+				print( "Adding custom library %s with architecture %s" % (path, arch) )
+
+			try:
+				customLibraries[ arch ][ name ] = path
+			except KeyError:
+				customLibraries[ arch ] = {}
+				customLibraries[ arch ][ name ] = path
 
 
 ###
-def processFile( args, file, customLibraries ):
+def processFile( args, file, arch, customLibraries ):
+	if ( file in args.processed ):
+		return
+
 	if ( args.verbose ):
 		print( "Processing %s" % file )
+	args.processed.add( file )
 
-	library_pattern = re.compile( r"^\s*([^\s]+)\s+=>\s+([^\s\(\)]+)" )
+	linked = set()
+	linked_pattern = re.compile( r"0x0+1 .*\[([^\]]+)\]" )
+	process = subprocess.Popen( ["readelf", "-d", file], stdout=subprocess.PIPE )
+	for line in process.stdout:
+		line = line.decode( "utf-8" ).strip()
+		match = re.match( linked_pattern, line )
+		if ( match is not None ):
+			linked.add( match.group(1) )
+
+	customDependencies = set()
+	library_pattern = re.compile( r"\s*([^\s]+)\s+=>\s+([^\s\(\)]+)" )
 	process = subprocess.Popen( ["ldd", file], stdout=subprocess.PIPE )
 	for line in process.stdout:
 		line = line.decode( "utf-8" ).strip()
@@ -104,20 +133,35 @@ def processFile( args, file, customLibraries ):
 
 		name = match.group(1)
 
-		# FIXME: Need to handle localized output here
-		if line.find( "not found" ) >= 0:
+		# Skip the library if it's an indirect dependency
+		if ( name not in linked ):
 			if ( args.verbose ):
-				if ( name in customLibraries ):
-					print( "\t%s => custom library" % name )
-				else:
-					print( "\t%s => not found" % name )
+				print( "\tnot linked directly with %s, skipping" % name )
+			continue
 
-			args.libraries.add( (name, None) )
-		else:
-			file = match.group(2)
+		if line.find( "/" ) >= 0:
+			path = match.group(2)
 			if ( args.verbose ):
-				print( "\t%s => %s" % (name, file) )
-			args.libraries.add( (name, file) )
+				print( "\t%s => %s" % (name, path) )
+
+			args.libraries[ arch ].add( (name, path) )
+
+		elif ( arch in customLibraries and name in customLibraries[ arch ] ):
+			if ( args.verbose ):
+				print( "\t%s => custom library" % name )
+ 
+			args.libraries[ arch ].add( (name, None) )
+
+			# Need to process the custom library for dependencies
+			customDependencies.add( customLibraries[ arch ][ name ] )
+		else:
+			if ( args.verbose ):
+				print( "\t%s => not found" % name )
+
+			args.libraries[ arch ].add( (name, None) )
+
+	for file in customDependencies:
+		processFile( args, file, arch, customLibraries )
 
 
 ###
@@ -139,8 +183,12 @@ def main():
 	                     help="Executable files to scan for package dependencies" )
 	args = parser.parse_args()
 
+	# Make sure COLUMNS isn't set, or dpkg will truncate its output
+	if ( "COLUMNS" in os.environ ):
+		del os.environ[ "COLUMNS" ]
+
 	# Build a list of custom libraries
-	customLibraries = set()
+	customLibraries = {}
 	if args.library_path is not None:
 		libraryPaths = args.library_path.split( ":" )
 		libraryPaths.reverse()
@@ -173,8 +221,8 @@ STEAM_DEPENDENCY_VERSION=%s
 """ % (" ".join(sys.argv), STEAM_RUNTIME, STEAM_DEPENDENCY_VERSION) )
 
 	# Process the input files
-	architectures = set()
-	args.libraries = set()
+	args.processed = set()
+	args.libraries = {}
 	for file in args.files:
 		if ( not os.path.exists( file ) ):
 			sys.stderr.write( "%s doesn't exist\n" % file )
@@ -187,35 +235,36 @@ STEAM_DEPENDENCY_VERSION=%s
 			args.output.close()
 			return 5
 
-		architectures.add( arch )
-
-		processFile( args, file, customLibraries )
-
+		if ( arch not in args.libraries ):
+			args.libraries[ arch ] = set()
+ 
+		processFile( args, file, arch, customLibraries )
+ 
 	# Process the libraries into packages
-	dependencies = set()
-	args.packages = {}
-	(fd, tempFile) = tempfile.mkstemp()
-	for (name, path) in args.libraries:
-		# Ignore libraries that are included in custom library paths
-		if ( name in customLibraries ):
-			if ( args.verbose ):
-				print( "Found dependency '%s' in the custom library path, ignoring." % name )
-			continue
-
-		if not path:
-			args.output.write("# WARNING: library '%s' couldn't be found in the library path, maybe you need to add --library-path command line option?\n" % name )
-			warnings += 1
-			continue
-
-		if ( args.verbose ):
-			print( "Adding dependency '%s'" % path )
-
-		dependencies.add(path)
-		os.write(fd, ("%s\n" % path).encode( "utf-8" ) )
-
 	packages = {}
 	package_pattern = re.compile( r"^([^\s]+):\s+([^\s]+)" )
-	for arch in architectures:
+	for arch in args.libraries:
+		dependencies = set()
+		(fd, tempFile) = tempfile.mkstemp()
+
+		for (name, path) in args.libraries[ arch ]:
+			# Ignore libraries that are included in custom library path
+			if ( arch in customLibraries and name in customLibraries[ arch ] ):
+				if ( args.verbose ):
+					print( "Found dependency '%s' in the custom library path" % name )
+				continue
+ 
+			if not path:
+				args.output.write( "# WARNING: library '%s' couldn't be found\n" % name )
+				warnings += 1
+				continue
+ 
+			if ( args.verbose ):
+				print( "Adding dependency '%s'" % path )
+ 
+			dependencies.add(path)
+			os.write(fd, ("%s\n" % path).encode( "utf-8" ) )
+ 
 		process = subprocess.Popen( ["apt-file", "find", "-a", arch, "--from-file", tempFile, "--fixed-string"], stdout=subprocess.PIPE )
 		for line in process.stdout:
 			line = line.decode( "utf-8" )
@@ -236,16 +285,15 @@ STEAM_DEPENDENCY_VERSION=%s
 			package.addLibrary( path )
 			dependencies.remove( path )
 
-	os.unlink(tempFile)
+		os.unlink(tempFile)
 
-	# Warn about any libraries we couldn't find
-	if ( len(dependencies) > 0 ):
-		if ( len(architectures) > 0 ):
-			args.output.write( "# WARNING: Couldn't find packages for the following libraries: (need to run apt-file update -a with architectures [%s]?)\n" % ", ".join( architectures ) )
-		for path in sorted( dependencies ):
-			args.output.write( "# \t%s\n" % path )
-		args.output.write( "\n" )
-		warnings += 1
+		# Warn about any libraries we couldn't find
+		if ( len(dependencies) > 0 ):
+			args.output.write( "# WARNING: Couldn't find packages for the following libraries: (need to run apt-file update -a %s ?)\n" % arch )
+			for path in sorted( dependencies ):
+				args.output.write( "# \t%s\n" % path )
+			args.output.write( "\n" )
+			warnings += 1
 
 	# Output package dependency list
 	for name in sorted( packages.keys() ):
